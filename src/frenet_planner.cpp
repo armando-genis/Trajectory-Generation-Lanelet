@@ -5,6 +5,8 @@
 
 #include <cmath>
 #include <iostream>
+#include <algorithm>
+#include <limits>
 
 
 namespace trajectory_frenet {
@@ -73,11 +75,20 @@ void TrajectoryPlanner::generateCandidatePaths(const LateralState& lateral_state
   candidate_paths.clear();
   candidate_paths.reserve(75); // Pre-allocate for expected number of paths (5 lanes × 3 velocities × 5 time horizons)
   
+  // Calculate target offsets once, outside the loop
+  std::vector<double> target_offsets;
+  if (!reference_path_.empty()) {
+    target_offsets = calculateLateralOffsetsFromPaths();
+  } else {
+    // Fall back to discrete highway lanes
+    target_offsets = lane_positions_;
+  }
+  
   // Iterate over prediction horizon range 
   for (double T = sp_.min_prediction_limit; T < sp_.max_prediction_limit; T += sp_.horizon_step) {
 
-    // Iterate over discrete highway lanes
-    for (double lat_offset : lane_positions_) {
+    // Iterate over target lateral offsets
+    for (double lat_offset : target_offsets) {
       double lat_speed = 0.0, lat_acceleration = 0.0;
       
       std::vector<std::vector<double>> lat_traj;
@@ -161,16 +172,50 @@ void TrajectoryPlanner::convertToWorldCoordinates(std::vector<FrenetPath>& candi
 
   // calculate x,y in world frame
   for (auto& candidate : candidate_paths) {
-    int j = 0;
     for (int i = 0; i < candidate.s.size(); ++i) {
-      double x, y, yaw;
-      for (; j < center_lane.size(); ++j) {
-        if (std::abs(candidate.s[i][0] - center_lane[j][4]) <= 0.1) {
-          x = center_lane[j][0] + candidate.d[i][0] * std::cos(center_lane[j][2] + 1.57);
-          y = center_lane[j][1] + candidate.d[i][0] * std::sin(center_lane[j][2] + 1.57);
-          break;
+      double x = 0.0, y = 0.0, yaw = 0.0;
+      bool found_match = false;
+      
+      // Find closest point in center_lane by s-coordinate
+      double target_s = candidate.s[i][0];
+      double min_distance = std::numeric_limits<double>::max();
+      int best_j = 0;
+      
+      for (int j = 0; j < center_lane.size(); ++j) {
+        double distance = std::abs(target_s - center_lane[j][4]);
+        if (distance < min_distance) {
+          min_distance = distance;
+          best_j = j;
         }
       }
+      
+      // Use the closest point for conversion
+      if (best_j < center_lane.size()) {
+        double ref_yaw = center_lane[best_j][2]; // yaw angle from center lane
+        
+        // Calculate perpendicular direction (90 degrees to the left of heading)
+        double perp_x = -std::sin(ref_yaw); // Left perpendicular 
+        double perp_y = std::cos(ref_yaw);
+        
+        x = center_lane[best_j][0] + candidate.d[i][0] * perp_x;
+        y = center_lane[best_j][1] + candidate.d[i][0] * perp_y;
+        found_match = true;
+      }
+      
+      if (!found_match) {
+        std::cerr << "Warning: No match found for s=" << target_s << std::endl;
+      }
+      
+      // Debug: Print first few conversions
+      static int conversion_count = 0;
+      if (conversion_count < 5 && i == 0) { // Only first point of first few paths
+        std::cout << "Conversion " << conversion_count << ": s=" << target_s 
+                  << " -> (" << x << ", " << y << ") from center_lane[" << best_j 
+                  << "] = (" << center_lane[best_j][0] << ", " << center_lane[best_j][1] 
+                  << "), d=" << candidate.d[i][0] << std::endl;
+        conversion_count++;
+      }
+      
       candidate.world.push_back({x,y,0,0});
     }
     
@@ -377,6 +422,227 @@ void TrajectoryPlanner::computeCost(FrenetPath& path) {
 
   // Total cost = weighted sum
   path.total_cost = cw_.klat * lateral_cost + cw_.klon * longitudinal_cost;
+}
+
+void TrajectoryPlanner::setGlobalWaypoints(const std::vector<point_struct>& waypoints) {
+  global_waypoints_ = waypoints;
+  processGlobalWaypoints();
+}
+
+void TrajectoryPlanner::processGlobalWaypoints() {
+  reference_path_.clear();
+  neighbor_paths_.clear();
+  
+  // Separate waypoints by priority
+  std::vector<std::vector<point_struct>> priority_groups(5); // Support priorities 1-4
+  
+  for (const auto& waypoint : global_waypoints_) {
+    if (waypoint.priority >= 1 && waypoint.priority <= 4) {
+      priority_groups[waypoint.priority].push_back(waypoint);
+    }
+  }
+  
+  // Process priority 1 waypoints (main reference path)
+  if (!priority_groups[1].empty()) {
+    reference_path_.reserve(priority_groups[1].size());
+    double cumulative_distance = 0.0;
+    
+    for (size_t i = 0; i < priority_groups[1].size(); ++i) {
+      const auto& wp = priority_groups[1][i];
+      
+      // Calculate cumulative distance
+      if (i > 0) {
+        const auto& prev_wp = priority_groups[1][i-1];
+        double dx = wp.x - prev_wp.x;
+        double dy = wp.y - prev_wp.y;
+        cumulative_distance += std::sqrt(dx*dx + dy*dy);
+      }
+      
+      // Calculate curvature (simplified - using heading change)
+      double curvature = 0.0;
+      if (i > 0 && i < priority_groups[1].size() - 1) {
+        const auto& prev_wp = priority_groups[1][i-1];
+        const auto& next_wp = priority_groups[1][i+1];
+        double heading_change = std::abs(next_wp.heading - prev_wp.heading);
+        double segment_length = std::sqrt(std::pow(next_wp.x - prev_wp.x, 2) + std::pow(next_wp.y - prev_wp.y, 2));
+        if (segment_length > 0.1) {
+          curvature = std::min(heading_change / segment_length, 1.0); // Cap at reasonable value
+        }
+      }
+      curvature = std::max(curvature, 1e-6); // Avoid zero curvature
+      
+      // Format: {x, y, yaw, curvature, cumulative_distance}
+      reference_path_.push_back({wp.x, wp.y, wp.heading, curvature, cumulative_distance});
+    }
+  }
+  
+  // Process priority 2+ waypoints (neighbor paths)
+  for (int priority = 2; priority <= 4; ++priority) {
+    if (priority_groups[priority].empty()) continue;
+    
+    // Group consecutive waypoints into separate paths based on spatial proximity
+    std::vector<std::vector<point_struct>> neighbor_groups;
+    std::vector<point_struct> current_group;
+    
+    // Sort by position to group nearby waypoints
+    auto sorted_neighbors = priority_groups[priority];
+    std::sort(sorted_neighbors.begin(), sorted_neighbors.end(), 
+              [](const point_struct& a, const point_struct& b) {
+                return a.x < b.x || (a.x == b.x && a.y < b.y);
+              });
+    
+    for (size_t i = 0; i < sorted_neighbors.size(); ++i) {
+      if (current_group.empty()) {
+        current_group.push_back(sorted_neighbors[i]);
+      } else {
+        // Check if this waypoint is close to the last one in current group
+        const auto& last_wp = current_group.back();
+        const auto& current_wp = sorted_neighbors[i];
+        double distance = std::sqrt(std::pow(current_wp.x - last_wp.x, 2) + std::pow(current_wp.y - last_wp.y, 2));
+        
+        if (distance < 15.0) { // Within 15m, consider same path
+          current_group.push_back(current_wp);
+        } else {
+          // Start new group
+          if (current_group.size() >= 3) { // Only keep groups with at least 3 points
+            neighbor_groups.push_back(current_group);
+          }
+          current_group.clear();
+          current_group.push_back(current_wp);
+        }
+      }
+    }
+    
+    // Add the last group
+    if (current_group.size() >= 3) {
+      neighbor_groups.push_back(current_group);
+    }
+    
+    // Convert neighbor groups to the required format
+    for (const auto& group : neighbor_groups) {
+      std::vector<std::vector<double>> neighbor_path;
+      double cumulative_distance = 0.0;
+      
+      for (size_t i = 0; i < group.size(); ++i) {
+        const auto& wp = group[i];
+        
+        // Calculate cumulative distance
+        if (i > 0) {
+          const auto& prev_wp = group[i-1];
+          double dx = wp.x - prev_wp.x;
+          double dy = wp.y - prev_wp.y;
+          cumulative_distance += std::sqrt(dx*dx + dy*dy);
+        }
+        
+        // Calculate curvature
+        double curvature = 0.0;
+        if (i > 0 && i < group.size() - 1) {
+          const auto& prev_wp = group[i-1];
+          const auto& next_wp = group[i+1];
+          double heading_change = std::abs(next_wp.heading - prev_wp.heading);
+          double segment_length = std::sqrt(std::pow(next_wp.x - prev_wp.x, 2) + std::pow(next_wp.y - prev_wp.y, 2));
+          if (segment_length > 0.1) {
+            curvature = std::min(heading_change / segment_length, 1.0); // Cap at reasonable value
+          }
+        }
+        curvature = std::max(curvature, 1e-6); // Avoid zero curvature
+        
+        neighbor_path.push_back({wp.x, wp.y, wp.heading, curvature, cumulative_distance});
+      }
+      
+      if (!neighbor_path.empty()) {
+        neighbor_paths_.push_back(neighbor_path);
+      }
+    }
+  }
+  
+  std::cout << "Processed global waypoints: Reference path has " << reference_path_.size() 
+            << " points, " << neighbor_paths_.size() << " neighbor paths" << std::endl;
+}
+
+std::vector<double> TrajectoryPlanner::calculateLateralOffsetsFromPaths() const {
+  std::vector<double> offsets;
+  
+  // Always include center lane (reference path)
+  offsets.push_back(0.0);
+  
+  // Calculate lateral offsets for neighbor paths relative to reference path
+  if (!reference_path_.empty()) {
+    for (const auto& neighbor_path : neighbor_paths_) {
+      if (neighbor_path.empty()) continue;
+      
+      // Calculate average lateral offset of this neighbor path
+      double total_offset = 0.0;
+      int valid_points = 0;
+      
+      for (const auto& neighbor_point : neighbor_path) {
+        // Find closest point on reference path
+        double min_dist = std::numeric_limits<double>::max();
+        double closest_lateral_offset = 0.0;
+        
+        for (size_t i = 0; i < reference_path_.size(); ++i) {
+          const auto& ref_point = reference_path_[i];
+          double dx = neighbor_point[0] - ref_point[0];
+          double dy = neighbor_point[1] - ref_point[1];
+          double dist = std::sqrt(dx*dx + dy*dy);
+          
+          if (dist < min_dist) {
+            min_dist = dist;
+            
+            // Calculate lateral offset using cross product for signed distance
+            if (i < reference_path_.size() - 1) {
+              const auto& next_ref = reference_path_[i + 1];
+              double ref_dx = next_ref[0] - ref_point[0];
+              double ref_dy = next_ref[1] - ref_point[1];
+              double ref_length = std::sqrt(ref_dx*ref_dx + ref_dy*ref_dy);
+              
+              if (ref_length > 0.01) {
+                // Normalize reference direction
+                ref_dx /= ref_length;
+                ref_dy /= ref_length;
+                
+                // Calculate lateral offset (cross product gives signed distance)
+                closest_lateral_offset = dx * (-ref_dy) + dy * ref_dx;
+              }
+            }
+          }
+        }
+        
+        if (min_dist < 20.0) { // Only consider points within 20m of reference path
+          total_offset += closest_lateral_offset;
+          valid_points++;
+        }
+      }
+      
+      if (valid_points > 0) {
+        double avg_offset = total_offset / valid_points;
+        // Round to nearest 0.5m for cleaner lane divisions
+        avg_offset = std::round(avg_offset * 2.0) / 2.0;
+        offsets.push_back(avg_offset);
+      }
+    }
+  }
+  
+  // Remove duplicates and sort
+  std::sort(offsets.begin(), offsets.end());
+  offsets.erase(std::unique(offsets.begin(), offsets.end(), 
+                [](double a, double b) { return std::abs(a - b) < 0.1; }), offsets.end());
+  
+  // Reduce debug spam - only print once
+  static bool printed_once = false;
+  if (!printed_once) {
+    std::cout << "Calculated " << offsets.size() << " lateral offsets from global paths" << std::endl;
+    printed_once = true;
+  }
+  return offsets;
+}
+
+std::vector<std::vector<double>> TrajectoryPlanner::getReferencePath() const {
+  return reference_path_;
+}
+
+std::vector<std::vector<std::vector<double>>> TrajectoryPlanner::getNeighborPaths() const {
+  return neighbor_paths_;
 }
 
 } // namespace trajectory_frenet
